@@ -1,0 +1,156 @@
+name: Image
+
+# Publishes nova-libvirt with /var/lib/swtpm-localca writable by tss.
+#
+# Pull requests build without pushing, so a broken Dockerfile fails in review
+# rather than on release. Only a release tag publishes: a container running in
+# the cluster should be traceable to a release, not to whatever main was that
+# day. workflow_dispatch rebuilds an existing tag against a newer base image
+# without cutting a new release.
+on:
+  pull_request:
+  push:
+    # '[0-9]*' is here so a tag written without the `v` fails loudly in the
+    # guard below instead of being a silent no-op.
+    tags: ['v*', '[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to rebuild, e.g. v1.0.0'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: nova-libvirt-swtpm
+  # Kolla 2025.1 builds its Ubuntu images on Noble; there is no jammy tag for
+  # this release. Change this, and only this, to move to another release.
+  KOLLA_BASE: quay.io/openstack.kolla/nova-libvirt:2025.1-ubuntu-noble
+
+jobs:
+  publish:
+    name: Build${{ github.event_name != 'pull_request' && ' and publish' || '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # contents:write so the release step can create the GitHub release.
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # The image tag is the git tag minus its leading `v`. There is no
+      # package version to cross-check against, unlike the Cinder driver, so
+      # the only thing to enforce is the tag's shape.
+      - name: Determine the version and image reference
+        id: version
+        if: github.event_name != 'pull_request'
+        env:
+          REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ref="${REF}"
+          case "${ref}" in
+            v[0-9]*) ;;
+            [0-9]*)
+              echo "::error::Tag ${ref} is missing the leading 'v'. Re-tag as v${ref}."
+              exit 1 ;;
+            *)
+              echo "::error::${ref} is not a release tag (expected vX.Y.Z)."
+              exit 1 ;;
+          esac
+          version="${ref#v}"
+          # OCI repository names must be lowercase; the owner login is not.
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "building ${image}:${version}"
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The Dockerfile's RUN step proves tss can write the directory, so a
+      # base image that changes the user or the package layout fails here,
+      # not as a failed vTPM boot on a blade.
+      - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/nova-libvirt/Dockerfile
+          build-args: KOLLA_BASE=${{ env.KOLLA_BASE }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ github.event_name != 'pull_request' && format('{0}:{1}', steps.version.outputs.image, steps.version.outputs.version) || 'nova-libvirt-swtpm:pr' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.base.name=${{ env.KOLLA_BASE }}
+
+      # A package first pushed with GITHUB_TOKEN is private even when the
+      # repository is public, and nothing above notices: the failure would
+      # surface on the blades as a pull auth error. Warns rather than fails,
+      # because the image really was published and visibility is a one-time
+      # manual change.
+      - name: Check the image can be pulled anonymously
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          TAG: ${{ steps.version.outputs.version }}
+        run: |
+          repo="${IMAGE#*/}"
+          response=$(curl -s -w '\n%{http_code}' \
+            --connect-timeout 10 --max-time 30 \
+            "https://ghcr.io/token?scope=repository:${repo}:pull" \
+            || printf '\n000')
+          status="${response##*$'\n'}"
+          body="${response%$'\n'*}"
+          token=$(printf '%s' "${body}" | jq -r '.token // empty' 2>/dev/null || true)
+
+          if [ -z "${token}" ]; then
+            case "${status}" in
+              401|403)
+                echo "::warning::${IMAGE}:${TAG} was published but is NOT anonymously pullable - the package is private, so Kolla will fail to pull it. Make the package public (see README)." ;;
+              *)
+                echo "::warning::Could not check whether ${IMAGE}:${TAG} is anonymously pullable: the token request returned HTTP ${status}. Verify by hand." ;;
+            esac
+            exit 0
+          fi
+
+          # Without this Accept header the registry answers 404 for an image
+          # that is public and present.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${TAG}")
+
+          if [ "${code}" = "200" ]; then
+            echo "${IMAGE}:${TAG} is anonymously pullable."
+          else
+            echo "::warning::${IMAGE}:${TAG} answered HTTP ${code} to an anonymous manifest request, so the blades may not be able to pull it."
+          fi
+
+      - name: Create the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ### Container image
+
+            ```
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+            ```
+
+            In `globals.d/02-compute.yml`:
+
+            ```yaml
+            nova_libvirt_image_full: "${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}"
+            ```
+
+            Built on `${{ env.KOLLA_BASE }}`.
